@@ -1,0 +1,240 @@
+import pandas as pd
+import numpy as np
+import statsmodels.formula.api as smf 
+import matplotlib.pyplot as plt 
+from statsmodels.stats.weightstats import ttest_ind
+from datetime import date
+from dateutil.relativedelta import relativedelta
+import seaborn as sns
+import random
+from math import floor 
+
+from autohubble import hubble_permalink_to_df, PRESTO
+import src.python.datascience.dsutils as ds
+
+pd.set_option('display.max_columns', None)
+
+sql_query = """
+SELECT * 
+FROM usertables.jhershaff_leadscoring_training_data_monthly_snapshots
+
+"""
+
+def clean_dates(df):
+    dtvars = df.select_dtypes(include=['datetime64[ns, UTC]']).columns.tolist()
+    for dv in dtvars:
+        df[dv]=pd.to_datetime(df[dv]).dt.tz_localize(None)
+    return df
+
+
+def remove_duplicate_domains(df):
+    # THERE ARE ~500 DOMAINS WITH MULTIPLE OBS (REGIONS-X-SEGMENTS) WITHIN AT LEAST ONE SNAPSHOT
+
+    replace_dict = {'Americas':'AMER','Europe':'EMEA','Asia':'APAC','Oceania':'APAC'}
+    df['canonical__geo__region'] = df['canonical__geo__region'].map(replace_dict)
+    df['canonical__geo__region'].value_counts()
+
+    df['dups'] = df.groupby(['domain','snap_date'])['decision_region'].transform('count')
+
+    # LOOK FOR CASES WHERE A DOMAIN HAS AT LEAST ONE LEAD THAT MATCHES ROSALIND DATA. IF SO, THEN 
+    # DROP ANY CASES WHERE THE LEAD SEGMENT/REGION DON'T MATCH ROSALIND SEGMENT/REGION.
+    # ONLY APPLIES TO DOMAINS THAT HAVE LEADS SPANNING MULTIPLE SEGMENTS OR REGIONS 
+    
+    df['lead_match_both'] = np.where((df['decision_region']==df['canonical__geo__region']) & 
+                                 (df['account_segment']==df['company_segment']),1,0)
+    df['lead_match_region'] = np.where((df['decision_region']==df['canonical__geo__region']),1,0)
+    df['lead_match_segment'] = np.where((df['account_segment']==df['company_segment']),1,0)
+
+    df['match_both'] = df.groupby(['domain','snap_date'])['lead_match_both'].transform('max')
+    df['match_region'] = df.groupby(['domain','snap_date'])['lead_match_region'].transform('max')
+    df['match_segment'] = df.groupby(['domain','snap_date'])['lead_match_segment'].transform('max')
+
+    df['dropobs'] = 0
+    df['dropobs'] = np.where((df['dups']>1) & (df['match_both']==1) & (df['lead_match_both']==0),1,df['dropobs'])
+    df['dropobs'] = np.where((df['dups']>1) & (df['match_region']==1) & (df['lead_match_region']==0),1,df['dropobs'])
+    df['dropobs'] = np.where((df['dups']>1) & (df['match_segment']==1) & (df['lead_match_segment']==0),1,df['dropobs'])
+    df = df.drop(df[df['dropobs']==1].index) 
+
+    df['dups'] = df.groupby(['domain','snap_date'])['decision_region'].transform('count')
+    df = df.drop(df[df['dups']>1].index) # drop remaining where duplicates but none match Rosalind 
+    
+    drop_cols = list(['dups','lead_match_both','lead_match_region','lead_match_segment','match_both','match_region',
+                      'match_segment','dropobs'])
+    df = df.drop(columns=drop_cols)
+    return df  
+
+
+def get_catlist(df,catvar,threshold):
+    tmp=pd.DataFrame(df.groupby([catvar])[metric].agg(['count','mean'])).reset_index()
+    minamt = threshold * len(df[df[splitvar]<split_date])
+    catlist = list(tmp[tmp['count']>minamt][catvar])
+    return catlist
+
+
+def get_dummies(df,catvar,threshold,prefix,metric,catlist):
+    valuelist = list()
+    if not catlist: 
+        catlist = get_catlist(df,catvar,threshold)
+    for val in catlist:
+        var = prefix+str(val)
+        df[var] = np.where(df[catvar]==val,1,0)
+        valuelist.append(var)
+        
+    # add missing dummy   
+    var = prefix+'missing'
+    df[var] = np.where(df[catvar].isnull()==1,1,0)
+    valuelist.append(var)
+    
+    return(df,valuelist,catlist)
+
+
+
+def clean_data(df,na2zerolist):
+    df[na2zerolist] = df[na2zerolist].fillna(0)
+    df['canonical__industry__group'] = df['canonical__industry__group'].replace({'\s':'_',
+                                                                                 '&':'_'
+                                                                                },regex=True)
+    df['company_segment_tier'] = [str(x).replace('.0','') for x in df['company_segment_tier']]
+    return df 
+    
+
+def test_efficiency(df,y_pred,metric):
+    df['score'] = y_pred
+    
+    auc_score = get_auc_cdf(df)
+
+    df['ev_value'] = df['score']*df[value]
+        
+    # WHAT DO THESE TOP LEADS LOOK LIKE? 
+
+    df['quantile_rank'] = pd.qcut(df['ev_value'], 5,
+                               labels = False,duplicates='drop')
+    score_counts = df.groupby(['quantile_rank'])[metric].agg(['count']).reset_index()
+    meanvals = df.groupby(['quantile_rank'])[list([metric,'converted_value'])].agg('mean').reset_index()
+    tmp = score_counts.merge(meanvals,on='quantile_rank',how='inner')
+    
+    return auc_score,tmp
+    
+def test_efficiency_cont(df,y_pred,metric):
+    df['yhat'] = y_pred
+    auc_score = get_auc_cdf(df)
+        
+    # WHAT DO THESE TOP LEADS LOOK LIKE? 
+
+    df['quantile_rank'] = pd.qcut(df['yhat'], 5,
+                               labels = False,duplicates='drop')
+    score_counts = df.groupby(['quantile_rank'])[metric].agg(['count']).reset_index()
+    meanvals = df.groupby(['quantile_rank'])[list([metric,'converted_value'])].agg('mean').reset_index()
+    tmp = score_counts.merge(meanvals,on='quantile_rank',how='inner')
+    
+    return auc_score,tmp
+    
+def get_auc_cdf(df):  
+    if df['score'].max() <= 1:
+        df['expected_value'] = df['score']*df[value]
+    else:
+        df['expected_value'] = df['score']
+    df = df.sort_values(by='expected_value',ascending=False)
+    df['cdf_converted_value'] = np.cumsum(df['converted_value'])/df['converted_value'].sum()
+    df[['score',value,'expected_value',metric,'converted_value','cdf_converted_value']]
+
+    xvars = np.arange(0,1,1/len(df))
+    if len(xvars) > len(df):
+        xvars = xvars[0:len(xvars)-1]
+    auc_score = auc(xvars,df['cdf_converted_value'])
+    return auc_score 
+    
+def run_propensity_model(formula,df):
+    model = smf.logit(formula,data=df).fit(disp=0);
+    print(model.summary())
+    
+    return model
+
+def get_inv_prob_weights(formula,df):
+    model = run_propensity_model(formula,df)
+ 
+    df['p']=model.predict(df)
+    df['wgt'] = np.where(df[treated_var]==1,1,df['p']/(1-df['p']))
+    return df
+
+def difference_in_mean_outcomes(df,metric,treated_var,wgt):
+    
+    formula = metric +'~' + treated_var
+
+    # Unweighted Difference in Means
+
+    model = smf.ols(formula,data=df).fit()
+    print("Unweighted Difference in Means: ", metric)
+    print(model.summary(),'\n')
+    print("Pct Impact: ",round(100*model.params[1]/model.params[0],2),'\n')
+
+    # Inverse-probability weighted difference in means
+    model = smf.wls(formula,weights=df[wgt],data=df).fit()
+    print("IPW Difference in Means: ", metric)
+    print(model.summary())
+    print("Pct Impact: ",round(100*model.params[1]/model.params[0],2),'\n')
+
+    
+def diff_mean_characteristics(df,treated_var,metrics_list,wgt):
+
+    # df2 = df1[df1['wgt'].isnull()==0].copy()
+    # metrics_list = ['risk_score','survival_score','hazard_score','npv_1m','npv_3m','npv_6m']
+    wm = lambda x: np.average(x, weights=df.loc[x.index,"wgt"])
+    unweighted_tstats = pd.DataFrame(columns=['metric','treated','untreated','p-value'])
+    weighted_tstats = pd.DataFrame(columns=['metric','treated','untreated','p-value'])
+
+    for m in metrics_list:
+
+        tmp = df.copy()
+        tmp = tmp.round(3)
+
+        treated = tmp[(tmp[treated_var]==1) & (tmp[m].isnull()==0)][m]
+        untreated = tmp[(tmp[treated_var]==0) & (tmp[m].isnull()==0)][m]
+        t,p,degf = ttest_ind(treated.dropna(), untreated.dropna())
+        unweighted_tstats = unweighted_tstats.append({'metric':m, 'treated':treated.mean(),'untreated':untreated.mean(),'p-value':p},ignore_index=True)
+        unweighted_tstats['pct_diff']=100*(unweighted_tstats['treated']-unweighted_tstats['untreated'])/unweighted_tstats['untreated']
+
+        wgt_t = tmp[(tmp[treated_var]==1) & (tmp[m].isnull()==0)][wgt]
+        wgt_u = tmp[(tmp[treated_var]==0) & (tmp[m].isnull()==0)][wgt]
+        tw,pw,degfw = ttest_ind(treated.dropna(), untreated.dropna(),weights=(wgt_t,wgt_u))
+        weighted_tstats = weighted_tstats.append({'metric':m, 'treated':treated.agg(wm),'untreated':untreated.agg(wm),'p-value':pw},ignore_index=True)
+        weighted_tstats['pct_diff']=100*(weighted_tstats['treated']-weighted_tstats['untreated'])/weighted_tstats['untreated']
+
+
+    print("Unweighted Differences in Means: \n", unweighted_tstats.round(3),'\n')
+    print("Weighted Differences in Means: \n", weighted_tstats.round(3))
+
+
+
+def diff_in_diff(df,timevar,startperiod,metric,treated_var,wgt):
+    df['post'] = np.where(df[timevar]>=startperiod,1,0)
+    df['treated_post'] = df['post']*df[treated_var]
+
+    dd_formula = metric + '~' + treated_var + '+post+treated_post'
+    model = smf.wls(dd_formula,data=df,weights=panel1[wgt]).fit()
+#     print(model.summary())
+    return model
+
+
+propensity_vars = 'score+lead_creation__selfserve+activation_probability+lead_creation__csf+account_segment_digital_native+account_segment_enterprise+account_segment_small_business'
+treated_var = 'routed__lead_source_noncsf_mql'
+prop_formula = treated_var + '~' + propensity_vars
+
+df1 = get_inv_prob_weights(prop_formula,noncsf)
+
+
+noncsf.groupby(treated_var)[metric].agg(['count','mean'])
+
+print(difference_in_mean_outcomes(df1,metric,treated_var,'wgt'))
+
+print(difference_in_mean_outcomes(df1,'converted_value',treated_var,'wgt'))
+
+metrics_list = ['score','lead_creation__selfserve','activation_probability','lead_creation__csf','account_segment_digital_native','account_segment_enterprise','account_segment_small_business']
+diff_mean_characteristics(df1[df1['wgt'].isnull()==0],treated_var,metrics_list,'wgt')
+
+formula = metric + '~' + treated_var + '+' + propensity_vars
+subset = df1.copy() 
+model = smf.wls(formula,weights=subset['wgt'],data=subset).fit()
+print("IPW Difference in Means: ", metric)
+print(model.summary())
+
