@@ -1,0 +1,202 @@
+install.packages("RHubble")
+library(RHubble)
+library(DBI)
+conn <- RHubble::prestoConnect()
+
+install.packages("Synth") 
+library(Synth)
+install.packages("dplyr")
+library(dplyr)
+library(magrittr)
+install.packages("ggplot2")        # Install ggplot2 package
+library("ggplot2")                 # Load ggplot2 package
+
+install.packages("reshape2")
+install.packages("reshape")
+library(reshape2)
+library(reshape)
+
+install.packages("data.table",dependencies=TRUE)
+install.packages("lubridate")
+library(lubridate)
+install.packages('tidyr')
+library(tidyr)
+
+
+sql_query = "
+GET MONTHLY PANEL OF DATA AND CHARACTERISTICS
+"
+
+# scale onr and piv using pre-period data
+scale_values <- function(df,T0,metric) {
+    std_var <- paste0(metric,'_std')
+    df[,std_var] <- (df[,metric] - mean(df[which(df$months<=T0),metric]))/sd(df[which(df$months<=T0),metric])
+    return(df)
+}
+
+get_closest_orgs <- function(df,thisorg,top_n,metric,T0) {
+    orgmean = mean(df[which(df$org_id==thisorg & df$months<=T0),metric])
+    top = aggregate(df[which(df$org_id != thisorg & df$months<=T0),metric], list(df[which(df$org_id != thisorg & df$months<=T0),]$org_id), FUN=mean) 
+    top$absdiff = abs(top$x-orgmean)
+    top$rank[order(top$absdiff)] <- 1:nrow(top)
+    top <- top[order(top$rank),]
+    top <- top[which(top$rank<=top_n),]
+    return(top)
+}
+
+stack_one_treated <- function(thisorg,df,top_n,metric,T0) {
+    # append treated org to top N untreated to create data for synthetic control
+    treated_org <- df[which(df$org_id==thisorg),]
+    treated_org$group_id <- 0
+    treated_org <- treated_org[order(treated_org$months),]
+    
+    top <- get_closest_orgs(df,thisorg,top_n,metric,T0)
+    untreated<-df[(df$org_id %in% top$Group.1),] %>%
+      dplyr::group_by(org_id) %>%
+      dplyr::mutate(group_id=cur_group_id())
+
+    untreated <- untreated[order(untreated$group_id, untreated$months),]
+    return(bind_rows(treated_org,untreated))
+}
+
+run_synth_get_weights <- function(df,thisorg,results,metric,T0,T1,plot_y_n,counter) {
+    poolsize = max(df$group_id)    
+    
+    cut1 <- T0-12+1
+    cut2 <- T0-6+1
+    cut3 <- T0-3+1
+    
+    dataprep.out <- dataprep(foo = df,
+     time.predictors.prior = 1:T1, #the entire time frame from the #beginning to the end
+     special.predictors = list(
+     list('age_activated_std',T0,'mean'),
+     list('hazard_score_std',T0,'mean'),
+     list('survival_score_std',T0,'mean'),
+     list('risk_score_std',T0,'mean'),
+     list('managed',T0,'mean'),
+#      list('piv_usd_std', 2:T0, 'mean'),
+     list('piv_usd_std', cut1:T0, 'mean'),
+     list('piv_usd_std', cut2:T0, 'mean'),
+     list('piv_usd_std', cut3:T0, 'mean'),
+     list('payments_onr_usd_std', 1:T0, 'mean'),
+     list('payments_onr_usd_std', cut1:T0, 'mean'),
+     list('payments_onr_usd_std', cut2:T0, 'mean'),
+     list('payments_onr_usd_std', cut3:T0, 'mean'),
+     list('moby_product_onr_std', 1:T0, 'mean'),
+     list('moby_product_onr_std', cut1:T0, 'mean'),
+     list('moby_product_onr_std', cut2:T0, 'mean'),
+     list('moby_product_onr_std', cut3:T0, 'mean'),
+     list(paste0(metric,'_std'), T0,'mean')),
+     dependent = metric, # dv
+     unit.variable = 'group_id', #identifying unit numbers
+     unit.names.variable = 'org_id', #identifying unit names
+     time.variable = 'months', #time-periods
+     treatment.identifier = 0, #the treated case
+     controls.identifier = c(1:poolsize), #the control cases; all others except target
+     time.optimize.ssr = 1:T0, #the time-period over which to optimize
+     time.plot = 1:T1) #the entire time period before/after the treatment
+
+    synth.out = invisible(synth(data.prep.obj = dataprep.out, method = 'BFGS'))
+
+    if(plot_y_n=='y')  {
+        vline = T0+0.5
+        # plot the changes before and after the treatment 
+        path.plot(synth.res=synth.out,dataprep.res = dataprep.out, 
+                  Ylab=paste(toupper(metric),'$',sep=' ',collapse=NULL),Xlab='month', 
+                  ,Legend = c('Target Org', 'Synthetic from Pool'),
+                  Main = metric,
+                  Legend.position = 'bottomright')
+        abline(v=vline,col='blue')
+    }
+    
+    gaps = dataprep.out$Y1plot - (dataprep.out$Y0plot 
+                                  %*% synth.out$solution.w)
+
+
+    mylist <- list("dataprep"=dataprep.out,"synth"=synth.out)
+    return(mylist)
+}
+
+mydata=dbGetQuery(conn,sql_query)
+head(mydata)
+
+metric <- 'moby_product_onr'
+treated_var <- 'email_sent'
+timevar <- 'mth'
+
+options(scipen=100)
+start_date <- as.Date('2019-01-01')
+event_date <- as.Date('2020-11-01')
+
+print(length(unique(mydata[which(mydata$email_sent==0),'org_id'])))
+print(length(unique(mydata[which(mydata$email_sent==1),'org_id'])))
+print(length(unique(mydata[which(mydata$mth > event_date),'mth'])))
+tmp <- mydata
+tmp$post <- ifelse(tmp$mth > event_date,1,0)
+aggregate(cbind(moby_product_onr,payments_onr_usd,piv_usd)~post+email_sent,data=tmp,FUN=mean)
+
+# AGGREGATE TREATED ORGS TO A SINGLE AVERAGE
+tmp_treated <- mydata[which(mydata[,treated_var]==1),]
+tmp_treated <- aggregate(cbind(piv_usd,payments_onr_usd,moby_product_onr,risk_score,survival_score,hazard_score,managed,age_activated)~mth,data=tmp_treated,FUN=mean,na.rm=TRUE)
+tmp_treated$org_id <- 'treated_orgs'
+tmp_treated$email_sent = 1
+
+tmp_donors <- mydata[which(mydata[,treated_var]==0),]
+tmp_donors <- subset(tmp_donors, select=c('org_id','mth','email_sent','piv_usd','payments_onr_usd','moby_product_onr','risk_score','survival_score','hazard_score','managed','age_activated'))
+
+
+X <- rbind(tmp_treated,tmp_donors)
+X$months <- interval(start_date,X$mth) %/% months(1)
+X <- X[complete.cases(X),]
+
+T1 <- max(X$months)
+T0 <- unique(X[which(X$mth==event_date),'months']) - 1
+
+merchant_results <-as.data.frame(matrix(nrow=T1),ncol=1)
+top_n = 100
+counter = 1
+plot_y_n = 'y'
+             
+target <- 'treated_orgs'
+metric <- 'moby_product_onr'
+
+
+df <- stack_one_treated(target,X[which(X$email_sent==0 | X$org_id==target),],top_n,metric,T0)
+for (v in list('piv_usd','payments_onr_usd','moby_product_onr','risk_score','survival_score','hazard_score','age_activated')) {
+    df <- scale_values(df,T0,v)
+}    
+# df <- create_match_vars(df,varlist,target)
+# tryCatch(merchant_results <- run_synth(df,target,merchant_results,metric,T0,T1,plot_y_n),error=function(e) e)
+synthlist<-run_synth_get_weights(df,target,merchant_results,metric,T0,T1,plot_y_n,counter)
+
+
+dataprep.out <- synthlist$dataprep
+synth.out <- synthlist$synth
+wgts <- merge(synth.out$solution.w,dataprep.out$names.and.numbers,by.x=0,by.y=2)
+df_w <- merge(df,wgts,by.x='org_id',by.y='unit.names',all.x=TRUE,all.y=TRUE)
+
+df_w$treated <- ifelse(df_w$org_id=='treated_orgs',1,0)
+df_w$w.weight <- ifelse(df_w$org_id=='treated_orgs',1,df_w$w.weight)
+dfw_6m <- df_w[which(df_w$mth >= as.Date('2020-05-01') & df_w$mth < event_date),]
+
+print("Unweighted Mean Differences:")
+aggregate(cbind(piv_usd,payments_onr_usd,moby_product_onr,risk_score,survival_score,hazard_score,age_activated)  ~ treated,dfw_6m,FUN='mean')
+
+print("Weighted Mean Differences:")
+data.frame(dfw_6m %>% 
+    group_by(treated) %>% 
+    summarise_at(cbind('piv_usd','payments_onr_usd','moby_product_onr','risk_score','survival_score','hazard_score','age_activated'), 
+                 funs(weighted.mean(., w.weight))))
+
+
+metric = 'piv_usd'
+
+df <- stack_one_treated(target,X[which(X$email_sent==0 | X$org_id==target),],top_n,metric,T0)
+for (v in list('piv_usd','payments_onr_usd','moby_product_onr','risk_score','survival_score','hazard_score','age_activated')) {
+    df <- scale_values(df,T0,v)
+}    
+# df <- create_match_vars(df,varlist,target)
+# tryCatch(merchant_results <- run_synth(df,target,merchant_results,metric,T0,T1,plot_y_n),error=function(e) e)
+synthlist<-run_synth_get_weights(df,target,merchant_results,metric,T0,T1,plot_y_n,counter)
+
+wgts[order(-wgts$w.weight),]
