@@ -1,0 +1,317 @@
+install.packages("ggplot2")        # Install ggplot2 package
+library("ggplot2")                 # Load ggplot2 package
+install.packages("RHubble")
+library(RHubble)
+library(DBI)
+conn <- RHubble::prestoConnect()
+
+# install.packages("Synth") 
+# library(Synth)
+install.packages("dplyr")
+library(dplyr)
+library(magrittr)
+
+install.packages("reshape2")
+install.packages("reshape")
+library(reshape2)
+library(reshape)
+
+install.packages("lubridate")
+library(lubridate)
+install.packages("CausalImpact")
+library(CausalImpact)
+
+# install.packages("tidyverse")
+# library(tidyverse)
+# install.packages("data.table",dependencies=TRUE)
+# install.packages('tidyr')
+# library(tidyr)
+
+
+# install.packages("data.table",dependencies=TRUE)
+# install.packages('tidyr')
+#library(tidyr)
+install.packages("lubridate")
+library(lubridate)
+install.packages("CausalImpact")
+library(CausalImpact)
+
+sql_query = "
+GET PANEL DATA OF DAILY SESSIONS, VISITORS, CONVERSIONS BY DMA
+"
+
+# scale values using pre-period data
+scale_values <- function(df,T0,metric) {
+    std_var <- paste0(metric,'_std')
+    df[,std_var] <- (df[,metric] - mean(df[which(df$day<=T0),metric]))/sd(df[which(df$day<=T0),metric])
+    return(df)
+}
+
+# 1 if match character variables
+match_charvar <- function(df,metric) {
+    val = unique(df[which(df[,idvar]==target),metric])
+    newvar <- paste0(metric,'_match')
+    df[,newvar] <- ifelse(df[,metric]==val,1,0)
+    return(df)
+}
+
+get_closest_orgs <- function(df,target,top_n,metric,T0) {
+    orgmean = mean(df[which(df[,idvar]==target & df$day<=T0),metric])
+    top = aggregate(df[which(df[,idvar] != target & df$day<=T0),metric], list(df[which(df[,idvar] != target & df$day<=T0),]$dmacity), FUN=mean) 
+    top$absdiff = abs(top$x-orgmean)
+    top$rank[order(top$absdiff)] <- 1:nrow(top)
+    top <- top[order(top$rank),]
+    top <- top[which(top$rank<=top_n),]
+    return(top)
+}
+
+stack_one_treated <- function(target,df,top_n,metric,T0) {
+    # append treated org to top N untreated to create data for synthetic control
+    treated_org <- df[which(df[,idvar]==target),]
+    treated_org$group_id <- 0
+    treated_org <- treated_org[order(treated_org$day),]
+    
+    top <- get_closest_orgs(df,target,top_n,metric,T0)
+    untreated<-df[(df[,idvar] %in% top$Group.1),] %>%
+      dplyr::group_by(dmacity) %>%
+      dplyr::mutate(group_id=cur_group_id())
+
+    untreated <- untreated[order(untreated$group_id, untreated$day),]
+    return(bind_rows(treated_org,untreated))
+}
+
+run_causal_impact <- function(target_cities,df,metric_list,sample_size,T0,T1,plot_y_n) {
+    
+    df[,idvar] <- gsub(" ", "_", df[,idvar])
+
+    set.seed(12345)
+    all_cities <- unique(df[,idvar])
+    pre.period <- c(1,T0)
+    post.period <- c(T0+1,T1)
+    
+    city_list = list()
+    ci_list<-list()
+    pe_list<-list()
+    fe_list <- list()
+    impact_list <- list()
+    p_list <- list()
+
+    for(target in target_cities) {
+        for(metric in metric_list) {
+            other_cities<-unlist(all_cities)
+            other_cities<-other_cities[other_cities != target]
+
+            pool <- list(sample(other_cities,sample_size))
+            target_df <- df[(df[,idvar] == target),c(idvar,metric,'day')]
+            sample_df <- df[(df[,idvar] %in% unlist(pool)),c(idvar,metric,'day')]
+            sample_df <- rbind(target_df,sample_df)
+            sample_wide <- reshape(sample_df,idvar='day',timevar='dmacity',direction='wide')
+            rownames(sample_wide) <- sample_wide$day
+            sample_wide <- subset(sample_wide,select=-c(day))
+            sample_wide<-sample_wide[ , colSums(is.na(sample_wide))==0]
+
+            impact <- CausalImpact(sample_wide,pre.period,post.period,model.args = list(nseasons = 7, season.duration = 1))
+            
+            if(plot_y_n=='y') {
+                print(plot(impact))
+            }
+            
+            city_list <- append(city_list,target)
+            impact_list <- append(impact_list,impact$summary$Actual[1])
+            ci_list<-append(ci_list,impact$summary$AbsEffect[1])
+            pe_list<-append(pe_list,impact$summary$RelEffect[1])
+            fe_list<-append(fe_list,impact$summary$RelEffect.sd[1])
+            p_list<-append(p_list,impact$summary$p[1])
+        }
+    }
+    results<-data.frame(unlist(city_list),unlist(metric_list),unlist(impact_list),unlist(ci_list),unlist(pe_list),unlist(fe_list),unlist(p_list))
+    names(results) <- c('city','metric','actuals','cumulative_impact','pct_impact','forecast_error','p_val')
+    return(results)
+
+}
+
+
+mydata=dbGetQuery(conn,sql_query)
+head(mydata)
+
+max(mydata[,'session_date'])
+
+# DATA CLEANING AND PRE-PROCESSING
+
+treated_var <- 'treated'
+timevar <- 'session_date'
+idvar <- 'dmacity'
+
+options(scipen=100)
+start_date <- min(mydata$session_date)
+event_date <- as.Date('2022-10-17')
+
+mydata$dmacity <- paste0(mydata$country,'_',mydata$city)
+mydata$day <- interval(start_date,mydata[,timevar]) %/% days(1)
+mydata$day <- mydata$day + 1
+T1 <- max(mydata$day)
+T0 <- max(mydata[which(mydata[,timevar]<event_date),'day'])
+# T0
+# T1
+# max(mydata[,timevar])
+
+T0
+T1
+max(mydata[,timevar])
+
+target_cities <- list('United_States_dma_807_San_Francisco','United_Kingdom_London_Area','Australia_Sydney')
+df <- mydata
+sample_size <- 100
+metric_list <- list('sessions','clients','signups','suspects')
+plot_y_n = 'n'
+
+all_results<-run_causal_impact(target_cities,df,metric_list,sample_size,T0,T1,plot_y_n)
+print(all_results)
+
+
+# stackedresults=dbGetQuery(conn,"SELECT * FROM usertables.jhershaff_brand_awareness_oct2022_pilot_results_stacked")
+# stackedresults
+
+# # STORE RESULTS IN HUBBLE TABLE
+# currmax <- strftime(max(mydata[,timevar]))
+# currdate <- as.character(Sys.Date())
+
+# # CHECK TO SEE IF MAX SESSIONS DATE IN TODAY'S RUN ALREADY EXISTS IN STACKED DATE
+# if(!(currmax %in% unique(stackedresults$max_sessions_date))) {
+
+#     print('Appending New Results')
+#     saveresults <- all_results
+#     saveresults$execution_date <- currdate
+#     saveresults$max_sessions_date <- currmax
+
+#     tablename<-'jhershaff_brand_awareness_oct2022_pilot_results'
+#     hubble <- dbConnect(RHubble::Hubble(), "presto")
+#     print(tablename)
+#     dbWriteTable(hubble, tablename, saveresults, overwrite = TRUE)
+    
+#     newstack<-rbind(stackedresults,saveresults)
+#     stackedtablename<-'jhershaff_brand_awareness_oct2022_pilot_results_stacked'
+#     dbWriteTable(hubble, stackedtablename, newstack, overwrite = TRUE)
+# }
+
+print("London")
+target_cities <- list('United_Kingdom_London_Area')
+df <- mydata
+sample_size <- 100
+metric_list <- list('sessions','clients','signups','suspects')
+plot_y_n = 'y'
+
+results<-run_causal_impact(target_cities,df,metric_list,sample_size,T0,T1,plot_y_n)
+
+print("San Francisco DMA")
+target_cities <- list('United_States_dma_807_San_Francisco')
+df <- mydata
+sample_size <- 100
+metric_list <- list('sessions','clients','signups','suspects')
+plot_y_n = 'y'
+
+results<-run_causal_impact(target_cities,df,metric_list,sample_size,T0,T1,plot_y_n)
+
+print("Sydney")
+target_cities <- list('Australia_Sydney')
+df <- mydata
+sample_size <- 100
+metric_list <- list('sessions','clients','signups','suspects')
+plot_y_n = 'y'
+
+results<-run_causal_impact(target_cities,df,metric_list,sample_size,T0,T1,plot_y_n)
+
+options(repr.plot.width = 12, repr.plot.height =8)
+
+tmp <- all_results
+tmp$error <- 100*1.645*tmp$forecast_error
+tmp$pct_impact <- 100*tmp$pct_impact
+tmp$metric <- factor(tmp$metric,levels=c("sessions","clients","signups","suspects"))
+
+tmp<-tmp %>% mutate(city = str_replace(city,"United_States_dma_807_San_Francisco","San Francisco DMA"))
+tmp<-tmp %>% mutate(city = str_replace(city,"United_Kingdom_London_Area","London Area"))
+tmp<-tmp %>% mutate(city = str_replace(city,"Australia_Sydney","Sydney"))
+
+ggplot(tmp,aes(x=as.factor(metric),y=pct_impact,fill=city)) +
+    geom_bar(position=position_dodge(),stat="identity",colour="black") + 
+    geom_errorbar(aes(ymin=pct_impact-error,ymax=pct_impact+error),width=0.2,position=position_dodge(0.9)) +
+    theme_bw() + xlab("metric") + ylab("impact estimate (percent)") + 
+    theme(text=element_text(size=20),legend.position=c(0.85,0.9)) +
+    scale_fill_manual(values=c("royalblue2","tomato2","mediumpurple2"))
+
+tmp<-mydata[mydata$city %in% c('dma_807_San Francisco','dma_501_New York'),]
+tmp<-tmp %>% mutate(city = str_replace(city,"dma_807_San Francisco","San Francisco DMA"))
+tmp<-tmp %>% mutate(city = str_replace(city,"dma_501_New York","New York City"))
+tmp$session_week <- floor_date(tmp$session_date,"weeks",week_start=1)
+tmp<-aggregate(cbind(clients,sessions,signups,suspects)~session_week+city,data=tmp,FUN=sum,na.rm=TRUE)
+
+tmp %>%
+    mutate(session_week=ymd(session_week)) %>%
+    ggplot(aes(x=session_week,y=sessions,colour=city)) + theme_bw()+
+    theme(text=element_text(size=18),legend.position=c(0.15,0.9)) +
+    geom_line()
+
+# RESULTS FOR UNTREATED CITY
+print("Seattle")
+target_cities <- list('United_States_dma_819_Seattle')
+df <- subset(mydata,!(dmacity %in% c('United States_dma_807_San Francisco','United Kingdom_London Area','Australia_Sydney')))
+sample_size <- 100
+metric_list <- list('sessions','clients','signups','suspects')
+plot_y_n = 'y'
+
+results<-run_causal_impact(target_cities,df,metric_list,sample_size,T0,T1,plot_y_n)
+print(results)
+
+# DISPLAY WHAT HAPPENS IF DONT EXCLUDE TREATED CITIES
+print("Seattle")
+target_cities <- list('United_States_dma_819_Seattle')
+# df <- subset(mydata,!(dmacity %in% c('United States_dma_807_San Francisco','United Kingdom_London Area','Australia_Sydney')))
+df <- mydata 
+sample_size <- 100
+metric_list <- list('sessions','clients','signups','suspects')
+plot_y_n = 'y'
+
+results<-run_causal_impact(target_cities,df,metric_list,sample_size,T0,T1,plot_y_n)
+print(results)
+
+# SOME PLOT FOR ONE OF THE TREATED CITIES
+set.seed(12345)
+target <- 'United_States_dma_807_San_Francisco'
+metric <- 'clients'
+
+post_end<-as.Date(max(mydata$session_date))
+pre_start <-as.Date(min(mydata$session_date))
+pre_end <-as.Date(max(mydata[which(mydata[,timevar]<event_date),'session_date']))
+
+sample_size <- 100
+df <- mydata
+
+df[,idvar] <- gsub(" ", "_", df[,idvar])
+
+all_cities <- unique(df[,idvar])
+pre.period <- as.Date(c("2022-02-01","2022-10-16"))
+post.period <- as.Date(c("2022-10-17","2022-12-18"))
+
+other_cities<-unlist(all_cities)
+other_cities<-other_cities[other_cities != target]
+
+pool <- list(sample(other_cities,sample_size))
+target_df <- df[(df[,idvar] == target),c(idvar,metric,'session_date')]
+sample_df <- df[(df[,idvar] %in% unlist(pool)),c(idvar,metric,'session_date')]
+sample_df <- rbind(target_df,sample_df)
+sample_wide <- reshape(sample_df,idvar='session_date',timevar='dmacity',direction='wide')
+sample_wide <- subset(sample_wide,select=-c(session_date))
+sample_wide<-sample_wide[ , colSums(is.na(sample_wide))==0]
+numdays<-nrow(sample_wide)
+time.points <- seq.Date(pre_start, by = 1, length.out = numdays)
+sample_wide <- zoo(sample_wide, time.points)
+
+impact <- CausalImpact(sample_wide,pre.period,post.period,model.args = list(nseasons = 7, season.duration = 1))
+
+plot(impact) + 
+    ggtitle("San Francisco DMA: Clients") + 
+    xlab('date') + ylab('unique clients') + 
+    scale_x_date(date_labels = "%b %d",date_breaks = "1 month") +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+
